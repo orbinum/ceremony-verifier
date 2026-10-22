@@ -1,0 +1,127 @@
+name: CI
+
+# Every push to main and every pull request into main. release.yml also calls
+# this workflow (`workflow_call`) on the commit it is about to release, so the
+# release gate is this exact set of jobs and cannot drift from it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+# A newer push to the same ref supersedes the older run. `github.workflow` is
+# the calling workflow's name ("CI" here, "Release" when release.yml calls it),
+# so a push to main never cancels the run the release is waiting on.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only token: CI never writes to the repository. Every action is pinned by commit.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml pins the toolchain (with rustfmt and clippy); rustup
+      # installs it on the first cargo call, so CI and local builds match.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Format check
+        run: make fmt-check
+
+      - name: Lint
+        run: make lint
+
+      - name: Docs
+        run: make doc
+
+      # Every test with every input, exactly as `make test-full` runs it
+      # locally: the pinned ptau (Stage B) and the rehearsal keys (real-key
+      # tests) are downloaded and checked by the Makefile, and a missing input
+      # fails instead of skipping — a suite that skips them would be green by
+      # absence, indistinguishable from green by passing. The cache key is the
+      # Makefile, where the URLs and pins live.
+      - name: Cache test inputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ptau/
+            vectors/*.tar.gz
+          key: test-inputs-${{ hashFiles('Makefile') }}
+
+      - name: Test (every input required)
+        run: make test-full
+
+  security:
+    name: Security
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install cargo-audit and cargo-deny
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-audit,cargo-deny
+
+      # Blocking, unlike an advisory-only audit: this binary is a security check
+      # of the ceremony, and a known-vulnerable dependency in it is a finding.
+      - name: Dependency audit (RustSec)
+        run: cargo audit
+
+      # Advisories, banned crates, sources (crates.io only) and licenses, per deny.toml.
+      - name: Dependency policy (cargo-deny)
+        run: cargo deny --locked check
+
+      - name: Check for secrets
+        uses: trufflesecurity/trufflehog@e76dff8a7e57d6df0c60ad8cbf5d5cba505a8fc9 # v3.99.2
+        with:
+          path: ./
+          # The pull request's base, or the previous head of the pushed branch
+          # (none on a branch's first push, when every commit is scanned).
+          base: ${{ github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || '' }}
+          head: HEAD
+          extra_args: --only-verified
+
+  all-checks:
+    name: All Checks Passed
+    runs-on: ubuntu-24.04
+    needs: [build, security]
+    if: always()
+    steps:
+      # Reports the actual result, not just "failed": a cancelled job means
+      # something cancelled this run, which is a very different bug from a test
+      # going red, and saying "checks failed" for it sends whoever reads this
+      # straight to the wrong place.
+      - name: Check status
+        run: |
+          status=0
+          for job in build:${{ needs.build.result }} security:${{ needs.security.result }}; do
+            name=${job%%:*}
+            result=${job#*:}
+            case "$result" in
+              success)   echo "✅ ${name}: passed." ;;
+              cancelled) echo "::error::${name} was cancelled — another run superseded this one."; status=1 ;;
+              skipped)   echo "::error::${name} never ran."; status=1 ;;
+              *)         echo "::error::${name} checks failed (${result})."; status=1 ;;
+            esac
+          done
+          exit $status

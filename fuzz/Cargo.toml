@@ -1,0 +1,38 @@
+# Coverage-guided fuzzing of the readers (cargo-fuzz, nightly): `make fuzz FUZZ_TARGET=zkey`.
+# Its own workspace and lockfile, so neither the verifier's build nor its `cargo test` sees it.
+[package]
+name = "orbinum-ceremony-verifier-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+orbinum-ceremony-verifier = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "zkey"
+path = "fuzz_targets/zkey.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "r1cs"
+path = "fuzz_targets/r1cs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ptau"
+path = "fuzz_targets/ptau.rs"
+test = false
+doc = false
+bench = false

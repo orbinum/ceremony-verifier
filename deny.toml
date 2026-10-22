@@ -1,0 +1,35 @@
+# cargo-deny policy (CI: `cargo deny --locked check`).
+
+[graph]
+all-features = true
+
+[advisories]
+# Every advisory fails, except the ones listed here, each with its reason.
+ignore = [
+  # `paste` is unmaintained (no vulnerability). It comes in through ark-ff 0.5 at build time
+  # (proc-macro), and arkworks has no release without it yet.
+  { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time macro via ark-ff 0.5; no alternative yet" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[licenses]
+# Compatible with this crate's GPL-3.0-or-later.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Unicode-3.0",
+  "Unlicense",
+  "GPL-3.0-or-later",
+]
+confidence-threshold = 0.9

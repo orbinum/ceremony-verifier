@@ -1,0 +1,97 @@
+[package]
+name = "orbinum-ceremony-verifier"
+version = "0.1.0"
+edition = "2021"
+authors = ["Orbinum Technologies <contact@orbinum.net>"]
+rust-version = "1.93"
+description = "Independent verifier for the Orbinum Groth16 phase-2 ceremony (arkworks, no snarkjs code)"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/orbinum/ceremony-verifier"
+publish = false
+
+[[bin]]
+name = "ceremony-verifier"
+path = "src/main.rs"
+
+# Integration tests, grouped by concern under tests/; one binary per file, so the time bounds of
+# one group never compete with another group's load.
+[[test]]
+name = "verifier_compat"
+path = "tests/verifier/compat.rs"
+
+[[test]]
+name = "verifier_checks"
+path = "tests/verifier/checks.rs"
+
+[[test]]
+name = "verifier_genesis"
+path = "tests/verifier/genesis.rs"
+
+[[test]]
+name = "cli_args"
+path = "tests/cli/args.rs"
+
+[[test]]
+name = "cli_hostile"
+path = "tests/cli/hostile.rs"
+
+[[test]]
+name = "hostile_keys"
+path = "tests/hostile/keys.rs"
+
+[[test]]
+name = "hostile_parsers"
+path = "tests/hostile/parsers.rs"
+
+[[test]]
+name = "hostile_robustness"
+path = "tests/hostile/robustness.rs"
+
+[dependencies]
+ark-bn254 = "0.5.0"
+ark-ec = "0.5.0"
+ark-ff = "0.5.0"
+blake2 = "0.10.6"
+libc = "0.2"
+sha2 = "0.10.9"
+rand = "0.8.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Restriction lints that matter in a fail-closed verifier: no panic paths on input.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+# The verdict goes through one explicit writer in main.
+print_stdout = "deny"
+# Pedantic lints that only add noise here.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+# Field and curve arithmetic reads best in its usual notation (x, y, z, h, r…).
+many_single_char_names = "allow"
+
+[profile.release]
+# An arithmetic overflow aborts (fail closed) instead of wrapping.
+overflow-checks = true
+lto = "thin"
+codegen-units = 1
+
+# Tests stay fast without losing debug assertions and overflow checks: light optimization for
+# this crate, full for its dependencies (arkworks).
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,0 +1,325 @@
+name: Release
+
+# A release is a version bump that has passed CI:
+#   - it starts on a push to main that changes Cargo.toml, where the version
+#     lives (or by hand on main, to finish a release that failed);
+#   - `verify` releases only a version with no GitHub release yet, not below the
+#     latest `vX.Y.Z` tag, and with its dated CHANGELOG section;
+#   - `ci` runs the whole CI workflow on this commit, and nothing is built,
+#     tagged or published unless All Checks Passed. A CI run of this exact commit
+#     that already passed (a push to main) is reused instead of running it again.
+# A push that changes Cargo.toml without a new version stays green and does nothing.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+  workflow_dispatch:
+
+# No token rights by default: each job asks for what it needs, and only `publish` may write.
+permissions: {}
+
+# Never cancel a release in flight: a run killed between `git push origin <tag>`
+# and the GitHub release leaves a tag with no binaries behind it. That state is
+# recoverable — `verify` asks for the release, not the tag — but a
+# half-finished release is still worth not creating on purpose.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify version
+    # A manual run releases main, never another branch.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # Reads this commit's CI runs.
+      actions: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+      should_release: ${{ steps.check.outputs.release }}
+      tag_exists: ${{ steps.check.outputs.tag_exists }}
+      ci_passed: ${{ steps.check.outputs.ci_passed }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          # Tags are NOT fetched by `fetch-depth: 0` — that only controls
+          # history depth. Without this the checks below see no tags at all.
+          fetch-tags: true
+
+      # The GitHub release, not the tag, is the record of what shipped: a run
+      # that died between tagging and releasing is finished by the next one —
+      # only if the tag names this commit, or the binaries would come from
+      # another commit than the one the tag names.
+      - name: Version, tag and CHANGELOG
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(awk -F'"' '/^\[package\]/ { p = 1 } p && /^version = / { print $2; exit }' Cargo.toml)
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Could not read a semantic version from Cargo.toml (got '$VERSION')."
+            exit 1
+          fi
+          TAG="v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "📦 Version: $VERSION"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "ℹ️  $TAG is already released — nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Exact `vX.Y.Z` tags only: the glob alone also matches `v1.2.3-rc1`.
+          LATEST=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -n 1 || true)
+          if [ -n "$LATEST" ] && [ "$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -V | head -n 1)" != "$LATEST" ]; then
+            echo "::error::Cargo.toml is at $VERSION, below the latest release $LATEST."
+            exit 1
+          fi
+
+          # The CHANGELOG section is the release notes. With no tag and no
+          # section yet, the first version is still in progress.
+          if ! grep -Eq "^## \[${VERSION//./\\.}\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md; then
+            if [ -z "$LATEST" ] && ! grep -q "^## \[$VERSION\]" CHANGELOG.md; then
+              echo "::warning::$VERSION is not released yet. Rename '## [Unreleased]' to '## [$VERSION] - $(date -u +%F)' to release it."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::CHANGELOG.md has no '## [$VERSION] - YYYY-MM-DD' section. Rename '## [Unreleased]' to '## [$VERSION] - $(date -u +%F)'."
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            TAGGED=$(git rev-parse "refs/tags/$TAG^{commit}")
+            if [ "$TAGGED" != "$GITHUB_SHA" ]; then
+              echo "::error::$TAG is tagged at $TAGGED, not at $GITHUB_SHA. Re-run the release of that commit, or delete the tag."
+              exit 1
+            fi
+            echo "⚠️  $TAG is tagged but has no GitHub release — finishing it."
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "✅ $TAG: new version — releasing once CI passes."
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+
+          # A CI run on a push to main of this exact commit that passed: the same workflow file
+          # on the same code, so running it again would only repeat it.
+          PASSED=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --branch main --event push \
+            --status success --json databaseId --jq 'length')
+          if [ "$PASSED" -gt 0 ]; then
+            echo "✅ CI already passed on $GITHUB_SHA — reusing it."
+            echo "ci_passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ci_passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The same jobs a push to main runs, on this exact commit. Reused rather than
+  # copied, so the release gate cannot drift from CI.
+  ci:
+    name: CI
+    needs: verify
+    if: needs.verify.outputs.should_release == 'true' && needs.verify.outputs.ci_passed != 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  # One binary per supported platform (Unix, 64-bit: KNOWN_LIMITS KL-18), only
+  # once CI has passed on this commit. Runner images are pinned, not `-latest`:
+  # an image migration would otherwise change the Linux binaries' glibc floor
+  # and the build environment between two releases without any commit saying so.
+  #
+  # After `ci` passed, or when it was skipped because this commit's CI had already passed.
+  # `always()` lets a skipped `ci` through; every other outcome stops here.
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [verify, ci]
+    if: >-
+      always() &&
+      needs.verify.result == 'success' &&
+      needs.verify.outputs.should_release == 'true' &&
+      (needs.ci.result == 'success' ||
+       (needs.ci.result == 'skipped' && needs.verify.outputs.ci_passed == 'true'))
+    runs-on: ${{ matrix.runner }}
+    # Dependency build scripts run here: no write token, no credentials left in the checkout.
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      # No cache: the shipped binary is built from a clean state, never from build output another
+      # workflow wrote. `--locked`: exactly the dependency versions in Cargo.lock, the ones CI
+      # tested and the ones a third party gets when building from the tag. The path remapping (the
+      # Makefile's `release`) keeps the build machine's paths out of the binary.
+      - name: Build
+        run: make release TARGET=${{ matrix.target }}
+
+      - name: Package
+        run: |
+          NAME="ceremony-verifier-${{ needs.verify.outputs.tag }}-${{ matrix.target }}"
+          mkdir -p "$NAME"
+          cp "target/${{ matrix.target }}/release/ceremony-verifier" LICENSE README.md CHANGELOG.md "$NAME/"
+          tar -czf "$NAME.tar.gz" "$NAME"
+          ls -lh "$NAME.tar.gz"
+
+      - name: Upload package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: ceremony-verifier-*.tar.gz
+          retention-days: 7
+
+  publish:
+    name: Tag and Release
+    needs: [verify, build]
+    if: needs.verify.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download packages
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: release
+          merge-multiple: true
+
+      # The binaries' checksums, and Cargo.lock's: a third party who builds
+      # from the tag can confirm they resolved the same dependency set.
+      - name: Checksums
+        run: |
+          TAG=${{ needs.verify.outputs.tag }}
+          cp Cargo.lock "release/Cargo-${TAG}.lock"
+          (cd release && sha256sum ./*.tar.gz "Cargo-${TAG}.lock" > "checksums-${TAG}.txt")
+          ls -lh release/
+          cat "release/checksums-${TAG}.txt"
+
+      # Signed build provenance for each package: anyone can check a download was built by this
+      # workflow from this commit (`gh attestation verify <file> --repo orbinum/ceremony-verifier`).
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release/*.tar.gz
+
+      - name: Create release notes
+        run: |
+          # The section for the version being released, by exact heading —
+          # matching "the first ## [" instead would pick up [Unreleased] and
+          # ship unreleased work as the release notes.
+          awk -v tag="## [${{ needs.verify.outputs.version }}]" '
+            index($0, tag) == 1  { flag = 1; next }
+            flag && /^## \[/     { exit }
+            flag && /^\[[^]]+\]:/{ exit }   # link definitions end the section
+            flag
+          ' CHANGELOG.md > release_notes_body.md
+
+          TAG=${{ needs.verify.outputs.tag }}
+          {
+            echo "## $TAG"
+            echo ""
+            if [ -s release_notes_body.md ]; then
+              cat release_notes_body.md
+            else
+              echo "- Release generated from CI."
+            fi
+            echo ""
+            echo "## Install"
+            echo ""
+            echo "Download the package for your platform and check it against the checksums:"
+            echo ""
+            echo '```sh'
+            echo "sha256sum --ignore-missing -c checksums-${TAG}.txt"
+            echo "tar -xzf ceremony-verifier-${TAG}-<target>.tar.gz"
+            echo '```'
+            echo ""
+            echo "Or build it yourself from this tag — what the ceremony asks of independent verifiers:"
+            echo ""
+            echo '```sh'
+            echo "git clone --branch ${TAG} https://github.com/orbinum/ceremony-verifier"
+            echo "cd ceremony-verifier && make release"
+            echo '```'
+            echo ""
+            echo "## Release Assets"
+            echo ""
+            echo "- \`ceremony-verifier-${TAG}-<target>.tar.gz\` — binary + LICENSE, README, CHANGELOG for \`x86_64-unknown-linux-gnu\`, \`aarch64-unknown-linux-gnu\`, \`aarch64-apple-darwin\`, \`x86_64-apple-darwin\`"
+            echo "- \`Cargo-${TAG}.lock\` — the exact dependency set"
+            echo "- \`checksums-${TAG}.txt\` — SHA-256 checksums"
+          } > release_notes.md
+
+      # Tags the commit only if the tag is not already there, so a retry after a
+      # failed release gets past this instead of dying on `tag already exists`.
+      #
+      # The `if:` above is the fast path; the check below is what makes the step
+      # correct. They are not redundant: `tag_exists` is computed in another job,
+      # on another checkout. Deciding again here, against the repository, cannot
+      # be fooled by how this clone was made.
+      - name: Create and push tag
+        if: needs.verify.outputs.tag_exists == 'false'
+        run: |
+          TAG="${{ needs.verify.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "ℹ️  Tag $TAG is already on the remote — leaving it as is."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG" "$GITHUB_SHA"
+          git push origin "$TAG"
+
+      # Last, and idempotent by design: the action updates an existing release
+      # rather than failing, so a retry refreshes the assets.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.verify.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Release ${{ needs.verify.outputs.tag }}
+          files: |
+            release/*.tar.gz
+            release/*.lock
+            release/*.txt
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,7 @@
+# Tests may unwrap and panic: a failed assertion is how they report. Production code may not
+# (see [lints] in Cargo.toml).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+# Proper names that `doc_markdown` would otherwise ask to backtick.
+doc-valid-idents = ["ChaCha", "ChaCha20", "BLAKE2b", ".."]
