@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- A release starts when CI passes on a push to `main`, on the commit CI tested, instead of
+  running the whole CI a second time. CI never cancels a run on `main`.
+
 ## [0.1.0] - 2026-10-21
 
 ### Added

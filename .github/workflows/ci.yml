@@ -1,21 +1,19 @@
 name: CI
 
-# Every push to main and every pull request into main. release.yml also calls
-# this workflow (`workflow_call`) on the commit it is about to release, so the
-# release gate is this exact set of jobs and cannot drift from it.
+# Every push to main and every pull request into main. A pass on a push to main
+# starts release.yml on the same commit.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-  workflow_call:
 
-# A newer push to the same ref supersedes the older run. `github.workflow` is
-# the calling workflow's name ("CI" here, "Release" when release.yml calls it),
-# so a push to main never cancels the run the release is waiting on.
+# A newer push to a pull request supersedes its older run. A run on main is never
+# cancelled: a release starts only from a commit whose run here passed, so every
+# main commit needs one.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Read-only token: CI never writes to the repository. Every action is pinned by commit.
 permissions:
